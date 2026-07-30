@@ -1,0 +1,36 @@
+# requirements.txt
+#
+# Split in two, because this repo runs in two very different modes:
+#
+# 1) SANDBOX DEMO MODE (examples/run_demo.py, tests/, debugger/) -- what
+#    was actually installed and run to validate this repo. No torch, no
+#    GPU, no network access to huggingface.co needed.
+#
+# 2) REAL MODEL MODE (core/hooks.py's KVHookManager/CacheTap wired to an
+#    actual Gemma via transformers) -- needs the second block too. Not
+#    installed/exercised here; see README.md "Running this against real
+#    Gemma".
+
+# --- Mode 1: sandbox demo / tests / debugger (all installed + run here) ---
+numpy>=1.26
+pandas>=2.2
+matplotlib>=3.8
+scikit-learn>=1.4        # PCA (core/visualize.py falls back to manual SVD if absent)
+networkx>=3.2             # nearest-neighbor graph layout
+PyYAML>=6.0
+plotly>=5.22
+streamlit>=1.35
+pytest>=8.0
+
+# --- Mode 2: real model mode (NOT installed in this sandbox) ---
+# torch>=2.3               # core/hooks.py's KVHookManager + CacheTap target this API
+# transformers>=4.42        # for loading Gemma + its Cache/DynamicCache objects
+# accelerate>=0.30          # multi-GPU / device_map="auto" loading of larger Gemma variants
+# bitsandbytes>=0.43        # real fp8/int4 kernels (compression/plugins.py numpy versions
+#                            #  are reference implementations of the same algorithms)
+# lm-eval>=0.4               # for evaluate_accuracy against real ARC/HellaSwag
+# umap-learn>=0.5            # optional: core/visualize.py's UMAP projection (else falls back to PCA)
+
+# gepa                       # optional: real reflective-mutation optimizer -- see
+#                             #  integrations/gepa_adapter.py's module docstring; not required,
+#                             #  the adapter's rule-based suggest_prompt_update() has no dependency on it.

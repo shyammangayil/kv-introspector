@@ -1,0 +1,48 @@
+# config/models.yaml
+# Subproblem 5 output: model + hook + storage configuration.
+#
+# `active_target: synthetic` is what examples/run_demo.py actually uses in
+# this sandbox (see README.md for why). The gemma-3-* entries show the real
+# config shape for when you have GPU + huggingface.co access: swap
+# `active_target`, supply HF credentials, and nothing else in this repo
+# needs to change -- core/hooks.py, core/inspector.py, compression/*, and
+# harness/* are all already model-agnostic.
+
+active_target: synthetic
+
+targets:
+  synthetic:
+    kind: synthetic
+    num_layers: 4
+    num_heads: 4
+    head_dim: 16
+    vocab_size: 1000
+
+  gemma-3-4b:
+    kind: huggingface
+    model_id: google/gemma-3-4b-it
+    dtype: bfloat16
+    device: cuda
+    attn_implementation: sdpa
+    trust_remote_code: false
+
+  gemma-3-27b:
+    kind: huggingface
+    model_id: google/gemma-3-27b-it
+    dtype: bfloat16
+    device: cuda
+    attn_implementation: sdpa
+    trust_remote_code: false
+
+hooks:
+  capture_attn_weights: true
+  capture_point: cache_tap      # cache_tap (recommended) | forward_hook -- see core/hooks.py
+
+storage:
+  events:
+    kind: sqlite                 # sqlite | jsonl | memory -- see core/storage.py::make_sink
+    path: data/events.db
+  experience:
+    path: data/experience.db
+  knowledge_graph:
+    path: data/knowledge_graph.db

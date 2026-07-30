@@ -1,0 +1,18 @@
+# config/budgets.yaml
+# Subproblem 5/6 output: resource limits enforced by harness/budget.py
+# *before* an experiment runs, and the pass/fail thresholds
+# harness/evaluator.py and success_criteria.md check against.
+
+max_kv_bytes: 536870912         # 512 MB
+max_tokens_in_flight: 100000
+
+retry:
+  max_attempts: 3
+  backoff_seconds: 0.1
+  backoff_multiplier: 2.0
+
+thresholds:
+  min_compression_ratio: 1.3     # >= 30% size reduction
+  max_ppl_delta_pct: 5.0         # < 5% perplexity increase
+  max_hook_latency_ms: 5.0       # per success_criteria.md "Performance"
+  max_visualization_render_s: 1.0
