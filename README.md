@@ -52,7 +52,7 @@ integration, retry/budget resilience — and prints real, measured results
 ```bash
 pytest tests/ -v
 ```
-54 tests, all torch-independent, run in well under a second.
+80 tests, all torch-independent, run in well under a second.
 
 **6. Launch the Timeline & Memory Debugger:**
 ```bash
@@ -71,10 +71,11 @@ That's the whole loop. Everything below is reference material.
 kv_introspector/
 ├── core/
 │   ├── hooks.py            # Subproblem 1: runtime hook layer (KVHookManager, CacheTap)
-│   ├── cache_adapters.py    # Normalizes transformers Cache API differences (legacy/DynamicCache/...)
-│   ├── storage.py           # SQLite schemas: events, experience, knowledge graph
-│   ├── inspector.py          # Subproblem 2: L2 norm / cosine sim / variance / age / duplicates
-│   └── visualize.py           # Subproblem 2: heatmap / PCA / UMAP / nearest-neighbor plots
+│   ├── cache_adapters.py    # Normalizes Cache API differences (legacy/DynamicCache/.k+.v/...)
+│   ├── kv_modifiers.py       # Live KV interventions (KVModifier + 6 implementations)
+│   ├── storage.py             # SQLite schemas: events, experience, knowledge graph, mutations
+│   ├── inspector.py            # Subproblem 2: L2 norm / cosine sim / variance / age / duplicates
+│   └── visualize.py             # Subproblem 2: heatmap / PCA / UMAP / nearest-neighbor plots
 ├── compression/
 │   ├── base.py               # Plugin contract (CompressionPlugin, CompressedResult)
 │   └── plugins.py             # Subproblem 3: fp8, int4, low-rank, sliding window, eviction, head pruning
@@ -91,12 +92,15 @@ kv_introspector/
 ├── examples/
 │   ├── synthetic_model.py         # NumPy transformer used for real in-sandbox validation
 │   ├── run_demo.py                 # End-to-end demo -- source of every number in this README
-│   └── run_gemma.py                 # Same pipeline against a real downloaded Gemma checkpoint
+│   ├── run_gemma.py                 # Same pipeline against a real downloaded Gemma checkpoint
+│   └── run_mutation_demo.py          # Proves KVModifier causally affects generation (numpy, no torch)
 ├── config/
 │   ├── models.yaml                 # Model/hook/storage config (synthetic + real Gemma targets)
 │   └── budgets.yaml                 # Resource limits + pass/fail thresholds
 ├── tests/
-│   └── test_core.py                 # 54 unit tests, no torch required
+│   ├── test_core.py                  # unit tests for core/, compression/, harness/
+│   └── test_kv_modifiers.py           # unit tests for core/kv_modifiers.py
+│                                        # 80 total, no torch required, run in well under a second
 ├── success_criteria.md              # Subproblem 6: criteria + this run's real scorecard
 ├── CHANGELOG.md                      # Real-world validation milestones and the bugs they found
 └── requirements.txt
@@ -111,7 +115,7 @@ Gemma-scale benchmark numbers that were never measured — would be worse
 than not having them.
 
 **Actually run, in the sandbox this repo was built in:**
-- Every module imports and runs correctly (`pytest tests/`: **54/54 pass**).
+- Every module imports and runs correctly (`pytest tests/`: **80/80 pass**).
 - `examples/run_demo.py` runs the entire pipeline against a real, small
   numpy-only transformer (4 layers, 4 heads, head_dim 16, untrained/random
   weights) with a **real causal-attention forward pass** and a **real,
@@ -159,23 +163,34 @@ than not having them.
   past run, since nothing cleared it and reads weren't scoped by
   `run_id`) in `CHANGELOG.md`.
 
-**Independently run against a real model, outside this sandbox, twice:**
-2026-07-28, `examples/run_gemma.py` ran end-to-end against a real,
-locally-downloaded `google/gemma-3-4b-it` (CPU) — model load, generation,
-hook capture, KV extraction, the full inspector + compression pipeline,
-against real weights and real captured tensors. Better evidence than
-anything this sandbox could produce itself (no GPU/HF access here — see
-below), precisely because it's independent: nobody involved in writing the
-code ran it. 2026-07-29, a second independent run (with the module-
-matching fix applied) surfaced the multimodal/accumulation findings above,
-prompting the CacheTap redesign. **Not yet independently re-confirmed
-after the redesign** — `core/hooks.py`'s new `CacheTap` (isinstance-safe
-retroactive subclassing) and `examples/run_gemma.py`'s new
-`DynamicCache(config=...)` + `generate(past_key_values=...)` wiring are
-unit-tested in this sandbox with duck-typed fakes (54/54 pass), but nobody
-has run this exact version against a real checkpoint yet. If you're the
-one running it: that's the next useful data point, and the biggest
-remaining unknown either way.
+**Independently run against a real model, outside this sandbox, three
+times:** 2026-07-28, `examples/run_gemma.py` ran end-to-end against a
+real, locally-downloaded `google/gemma-3-4b-it` (CPU) — model load,
+generation, hook capture, KV extraction, the full inspector + compression
+pipeline, against real weights and real captured tensors. Better evidence
+than anything this sandbox could produce itself (no GPU/HF access here —
+see below), precisely because it's independent: nobody involved in
+writing the code ran it. 2026-07-29 (morning), a second independent run
+surfaced the multimodal/accumulation findings above, prompting the
+CacheTap redesign. **2026-07-29 (afternoon), a third independent run
+confirmed the redesign works**: `DynamicCache(config=text_cfg)`
+construction succeeded exactly as documented, `isinstance(cache,
+DynamicCache)` held, and `verify_capture_integrity` reported every one of
+34 real layers matching. That same run surfaced two more real bugs (a
+miscalibrated `head_pruning` threshold, and a since-explained one-token
+discrepancy between reported "generated tokens" and the cache's own
+length) — both fixed, detailed in `CHANGELOG.md`.
+
+**`core/kv_modifiers.py` (live KV interventions) is new as of 2026-07-29
+afternoon and has NOT been run against real Gemma yet.** Proven causally
+correct in this sandbox against a small standalone model (pure numpy, no
+torch) — `examples/run_mutation_demo.py` shows real interventions
+(zeroing, swapping, noising, scaling, decaying, live low-rank
+reconstruction) actually changing greedy-decoded output vs. an identical
+unmodified baseline, with cache-integrity verified throughout. Wired into
+`examples/run_gemma.py` via `--modifier`/`--compare-baseline`, unit-tested
+without torch, but the real-Gemma path is unconfirmed — the next most
+useful thing anyone running this can do.
 
 **NOT run in this sandbox specifically**, because the infra isn't
 available here (no GPU, no network access to huggingface.co for
@@ -304,9 +319,10 @@ in `CHANGELOG.md`):**
   matching HuggingFace's own documented usage
   (huggingface.co/docs/transformers/en/kv_cache, "Cache strategies"), not
   a guess. Falls back to bare `DynamicCache()` on `TypeError` for older
-  transformers versions. **This specific construction has not been
-  confirmed against a real checkpoint yet** — it's the most important
-  thing to watch on your first run after this update.
+  transformers versions. **Confirmed working against real
+  `google/gemma-3-4b-it`** (2026-07-29 afternoon run — see `CHANGELOG.md`):
+  construction succeeded, `isinstance(cache, DynamicCache)` held, and
+  `verify_capture_integrity` matched on all 34 layers.
 - `-it` checkpoints load a *composite* `Gemma3Config` — architecture
   fields like `num_hidden_layers` live under
   `model.config.get_text_config()`, not `model.config` directly.
@@ -329,7 +345,13 @@ in `CHANGELOG.md`):**
   attention materializes the full attention matrix, and
   `output_attentions` disables some fused-kernel fast paths). Without
   `--cross-check`, CacheTap alone needs neither, so the default `sdpa`
-  backend is used and this shouldn't apply.
+  backend is used — but the one real measurement of *that* path so far
+  (no `--cross-check`, 5 generated tokens) took ~386s total, i.e. slower
+  per-token than the eager number above, not faster. Plausible
+  explanations (first-run kernel warmup, CPU `sdpa` not being especially
+  optimized relative to eager on this specific machine/PyTorch build) are
+  just that -- plausible, not confirmed. Reported as measured rather than
+  smoothed into "sdpa is faster" because it wasn't, this time.
 - First download is several GB — budget time/disk accordingly, and note
   `HF_HOME` (defaults to `~/.cache/huggingface`) if you want it elsewhere.
 
@@ -337,6 +359,53 @@ For perplexity/accuracy against Wikitext-2/ARC/HellaSwag, pass your loaded
 `model`/`tokenizer` into `Evaluator.evaluate_perplexity` /
 `.evaluate_accuracy` instead of `None` (needs `pip install lm-eval` too for
 loading the actual datasets).
+
+---
+
+## Live KV modification (causal experiments, not just observation)
+
+Everything above *observes* the cache. `core/kv_modifiers.py` adds
+`KVModifier`: wired into `CacheTap`, it intercepts every real cache
+update and can change what gets stored — persistently, so "zero this
+token" stays zeroed for the rest of generation, not just the one step
+where it ran. This is what makes "does the model still say Ulaanbaatar if
+I zero token 4" a real causal question about the model, not a
+reconstruction-error number about an offline snapshot.
+
+**Try it on the synthetic model first (fast, no torch needed):**
+```bash
+python -m examples.run_mutation_demo
+```
+Runs 8 interventions (zero a token, zero every prompt token, swap two
+tokens, add noise, drop a head, amplify a head, decay old memories, live
+low-rank compression) against a small real (untrained but real-math)
+model, shows which changed the output vs. an identical baseline, and
+proves the memory-decay math compounds correctly with real measured
+numbers, not just an asserted formula.
+
+**Try it on real Gemma:**
+```bash
+python -m examples.run_gemma --model google/gemma-3-4b-it --modifier "zero:token_positions=0,3" --compare-baseline
+```
+`--modifier 'name:key=val;key=val'` (semicolon between kwargs, comma
+within a list-valued one — e.g. `head_mask:head_indices=1,3;scale=0.0`).
+Available modifiers and their parameters:
+
+| Modifier | Parameters | What it does |
+|---|---|---|
+| `zero` | `token_positions`, `head_indices`, `layer_indices` | Zero specific tokens'/heads' KV |
+| `noise` | `sigma`, `target` (key\|value\|both), `seed` | Add Gaussian noise |
+| `swap_tokens` | `pos_a`, `pos_b` | Swap two token positions' KV |
+| `head_mask` | `head_indices`, `scale`, `target` | 0=drop a head, >1=amplify it |
+| `memory_decay` | `decay_per_step` | Progressively weaken older tokens (forgetting) |
+| `low_rank_live` | `rank` | Feed live SVD-truncated KV back into generation |
+
+`--compare-baseline` runs generation twice (clean, then modified) and
+diffs the output — doubles generation time, so it's opt-in. Every
+modifier experiment (config, prompt, both outputs, latency, whether
+`verify_capture_integrity` still held afterward) is logged to
+`data/mutations_gemma.db` via `core/storage.py::MutationDB`. **Not yet
+run against real Gemma** — see the honesty section above.
 
 ---
 
@@ -354,6 +423,15 @@ loading the actual datasets).
   (forward hooks on attention modules) is demoted to optional,
   storage-decoupled instrumentation — cross-checking / attention entropy
   only, no longer a KVEvent source. Full account in `CHANGELOG.md`.
+- **`KVModifier` interventions persist via write-back, not just a
+  returned value** (`core/kv_modifiers.py` + `core/cache_adapters.py`'s
+  `set_layer_kv`) — a modifier's output is written into the cache's own
+  storage, not just returned from that one `update()` call, so
+  `MemoryDecayModifier` can compound correctly step over step and a
+  zeroed token stays zeroed for the rest of generation. Every modifier
+  uses only indexing/multiplication/addition, which numpy and torch
+  tensors both support identically, so none of them need to know or care
+  which framework handed them the tensor.
 - **A dedicated normalization layer** (`core/cache_adapters.py`) isolates
   every place this repo needs to know which shape `transformers`' Cache
   API happens to be this release (legacy tuple / `DynamicCache.layers` /
