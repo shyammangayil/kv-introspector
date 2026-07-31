@@ -352,9 +352,22 @@ class CacheTap:
         from transformers import DynamicCache
         cache = CacheTap(DynamicCache(), sink)           # cache IS-A DynamicCache
         model.generate(**inputs, past_key_values=cache)   # every update() writes real KVEvents
+
+    Pass `modifier=` (a `core.kv_modifiers.KVModifier`) to make this a LIVE
+    intervention point, not just an observer: after the real cache append,
+    the modifier gets the full current key/value for that layer and can
+    return a changed version, which is written back into the cache's own
+    storage (`core.cache_adapters.set_layer_kv`) -- so the change is what
+    the model's OWN next attention computation reads, and persists for
+    every future step too, not just this one. This is what makes "zero
+    this token, does the model still generate the same thing" a real
+    causal experiment rather than an offline reconstruction-error metric.
     """
 
-    def __new__(cls, cache: Any, sink: EventSink, run_id: Optional[str] = None):
+    def __new__(
+        cls, cache: Any, sink: EventSink, run_id: Optional[str] = None,
+        modifier: Optional[Any] = None,
+    ):
         if not hasattr(cache, "update"):
             raise TypeError(
                 f"CacheTap needs an object with an `update(key_states, value_states, "
@@ -368,12 +381,40 @@ class CacheTap:
         class _Traced(base_cls):
             def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
                 t0 = time.perf_counter()
-                out = super().update(key_states, value_states, layer_idx, cache_kwargs)
+                n_new = int(key_states.shape[-2])
+                pre_existing = step_by_layer.get(int(layer_idx), 0)
+
+                full_key, full_value = super().update(key_states, value_states, layer_idx, cache_kwargs)
+
+                if modifier is not None and modifier.applies_to_layer(int(layer_idx)):
+                    meta = {
+                        "run_id": run_id_, "layer_idx": int(layer_idx),
+                        "is_prefill": n_new > 1, "new_token_start": pre_existing,
+                        "new_token_count": n_new, "total_seq_len": pre_existing + n_new,
+                    }
+                    mod_key, mod_value = modifier.modify(int(layer_idx), full_key, full_value, meta)
+                    if (mod_key is not full_key) or (mod_value is not full_value):
+                        from core.cache_adapters import set_layer_kv
+                        set_layer_kv(self, layer_idx, mod_key, mod_value)
+                        full_key, full_value = mod_key, mod_value
+
                 latency_ms = (time.perf_counter() - t0) * 1000.0
                 call_count_by_layer[int(layer_idx)] = call_count_by_layer.get(int(layer_idx), 0) + 1
-                _write_update_events(sink, run_id_, layer_idx, key_states, value_states,
+                # Log whatever ended up ACTUALLY stored (post-modification, if
+                # any) -- new-token slice out of the full (possibly modified)
+                # tensor, so KVEvents stay truthful to what verify_capture_
+                # integrity() would check against get_seq_length(). Ellipsis,
+                # not explicit axis count: real transformers Cache tensors are
+                # 4D ([batch, kv_heads, seq, head_dim]), but this repo's
+                # synthetic model and test fakes use 3D ([batch, seq, dim]) --
+                # seq is always the second-to-last axis and head_dim always
+                # the last, by convention throughout this codebase, so this
+                # slice is correct either way.
+                new_key = full_key[..., pre_existing:pre_existing + n_new, :]
+                new_value = full_value[..., pre_existing:pre_existing + n_new, :]
+                _write_update_events(sink, run_id_, layer_idx, new_key, new_value,
                                       latency_ms, step_by_layer)
-                return out
+                return full_key, full_value
 
         _Traced.__name__ = f"Traced{base_cls.__name__}"
         _Traced.__qualname__ = _Traced.__name__

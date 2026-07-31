@@ -62,7 +62,13 @@ def get_layer_kv(cache: Any, layer_idx: int):
          time this was written against a real model) -- included because
          it cost nothing to also handle and was a real public attribute
          for a while.
-      4. `.to_legacy_cache()` -- last-resort flattening for any other
+      4. `.k[i]` / `.v[i]` -- this repo's own simple convention
+         (`examples/synthetic_model.py`'s `NumpyKVCache`, and test fakes):
+         lists indexed by layer_idx, one array per layer. Not a
+         transformers shape at all -- included so this adapter is the
+         single place *every* cache convention used anywhere in this repo
+         goes through, not just the real-model ones.
+      5. `.to_legacy_cache()` -- last-resort flattening for any other
          Cache subclass that supports it.
     """
     if isinstance(cache, tuple):
@@ -75,6 +81,12 @@ def get_layer_kv(cache: Any, layer_idx: int):
     if hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
         return cache.key_cache[layer_idx], cache.value_cache[layer_idx]
 
+    if hasattr(cache, "k") and hasattr(cache, "v"):
+        # This repo's own simple convention (examples/synthetic_model.py's
+        # NumpyKVCache, and test fakes): cache.k / cache.v are lists
+        # indexed by layer_idx, one array per layer.
+        return cache.k[layer_idx], cache.v[layer_idx]
+
     if hasattr(cache, "to_legacy_cache"):
         legacy = cache.to_legacy_cache()
         if legacy is not None:
@@ -82,8 +94,8 @@ def get_layer_kv(cache: Any, layer_idx: int):
 
     raise TypeError(
         f"Don't know how to extract K/V from {type(cache).__name__} -- none of "
-        "tuple / .layers[i] / .key_cache[i] / .to_legacy_cache() matched. This is "
-        "exactly the kind of thing this adapter exists to isolate -- add a branch "
+        "tuple / .layers[i] / .key_cache[i] / .k[i]+.v[i] / .to_legacy_cache() matched. "
+        "This is exactly the kind of thing this adapter exists to isolate -- add a branch "
         "here rather than in core/inspector.py or compression/plugins.py."
     )
 
@@ -112,6 +124,42 @@ def get_layer_meta(cache: Any, layer_idx: int) -> LayerMeta:
 
     k, _ = get_layer_kv(cache, layer_idx)
     return LayerMeta(layer_idx=layer_idx, layer_type="unknown", seq_len=int(k.shape[-2]))
+
+
+def set_layer_kv(cache: Any, layer_idx: int, keys, values) -> None:
+    """Write-back companion to `get_layer_kv` -- overwrites the actual
+    stored K/V for one layer, IN PLACE. This is what makes a
+    `core.kv_modifiers.KVModifier` intervention *persistent* (affecting
+    every future `update()` call for this layer, not just the current
+    forward pass): without writing back into the cache's own storage, a
+    modification would only ever affect the tensors `update()` happens to
+    return this one time, and the cache's internal accounting would still
+    hold the original, unmodified values for the next call to build on.
+
+    Same conventions as `get_layer_kv`, in the same preference order
+    (skips the tuple and `.to_legacy_cache()` cases -- both produce
+    immutable/derived copies with nothing to write back into; a caller
+    working with one of those needs to reconstruct the whole cache
+    themselves).
+    """
+    if hasattr(cache, "layers"):
+        layer = cache.layers[layer_idx]
+        layer.keys = keys
+        layer.values = values
+        return
+    if hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
+        cache.key_cache[layer_idx] = keys
+        cache.value_cache[layer_idx] = values
+        return
+    if hasattr(cache, "k") and hasattr(cache, "v"):
+        cache.k[layer_idx] = keys
+        cache.v[layer_idx] = values
+        return
+    raise TypeError(
+        f"Don't know how to write K/V back into {type(cache).__name__} -- none of "
+        ".layers[i] / .key_cache[i]+.value_cache[i] / .k[i]+.v[i] matched (and a plain "
+        "tuple or to_legacy_cache() output is a derived copy, not handled here either)."
+    )
 
 
 def describe_cache(cache: Any, n_layers: int) -> str:

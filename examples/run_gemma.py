@@ -33,9 +33,10 @@ from pathlib import Path
 
 import numpy as np
 
-from core.storage import SQLiteEventSink, KnowledgeGraphDB
+from core.storage import SQLiteEventSink, KnowledgeGraphDB, MutationDB
 from core.hooks import CacheTap, KVHookManager, verify_capture_integrity
 from core.cache_adapters import get_layer_kv, get_layer_meta, describe_cache
+from core.kv_modifiers import MODIFIER_REGISTRY
 from core.inspector import KVCacheInspector
 from core import visualize
 from compression.plugins import PLUGIN_REGISTRY, get_plugin
@@ -43,6 +44,34 @@ from harness.evaluator import Evaluator
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "outputs"
+
+
+def _parse_modifier_spec(spec: str):
+    """'name:key=val;key=val' -> a core.kv_modifiers.KVModifier instance.
+    List-valued kwargs (token_positions, head_indices, layer_indices) take
+    comma-separated ints: 'zero:token_positions=0,4'
+    'head_mask:head_indices=1,3;scale=0.0'   (semicolon between kwargs,
+    since comma is already used for list values within one kwarg)
+    'noise:sigma=2.0;target=key;seed=0'
+    """
+    name, _, kwargs_str = spec.partition(":")
+    name = name.strip()
+    if name not in MODIFIER_REGISTRY:
+        raise ValueError(f"Unknown modifier {name!r}. Available: {sorted(MODIFIER_REGISTRY)}")
+    cls = MODIFIER_REGISTRY[name]
+    list_keys = {"token_positions", "head_indices", "layer_indices"}
+    kwargs: dict = {}
+    for pair in filter(None, (p.strip() for p in kwargs_str.split(";"))):
+        k, _, v = pair.partition("=")
+        k, v = k.strip(), v.strip()
+        if k in list_keys:
+            kwargs[k] = [int(x) for x in v.split(",") if x.strip()]
+        else:
+            try:
+                kwargs[k] = int(v) if v.lstrip("-").isdigit() else float(v)
+            except ValueError:
+                kwargs[k] = v
+    return cls(**kwargs)
 
 
 def main() -> None:
@@ -70,6 +99,16 @@ def main() -> None:
                           "entropy. Needs eager attention + output_attentions=True, which is "
                           "much slower (~35s/generated-token observed for -4b-it on CPU) -- off "
                           "by default so a first run is fast; turn on once you want the proof.")
+    ap.add_argument("--modifier", default=None,
+                     help="Apply a live KV intervention (core/kv_modifiers.py) during "
+                          "generation, e.g. --modifier 'zero:token_positions=0,3' or "
+                          "--modifier 'noise:sigma=2.0'. Available: " + ", ".join(sorted(MODIFIER_REGISTRY)) +
+                          ". See core/kv_modifiers.py for each one's parameters.")
+    ap.add_argument("--compare-baseline", action="store_true", default=False,
+                     help="Only meaningful with --modifier: runs generation TWICE (once "
+                          "unmodified, once with the modifier), prints both outputs side by "
+                          "side, and logs the comparison to data/mutations_gemma.db. Doubles "
+                          "generation time -- off by default.")
     args = ap.parse_args()
 
     # Imported here (not at module level) so `pytest` / `run_demo.py` keep working
@@ -137,7 +176,12 @@ def main() -> None:
         base_cache = DynamicCache(config=text_cfg)
     except TypeError:
         base_cache = DynamicCache()
-    cache = CacheTap(base_cache, sink, run_id=run_id)
+
+    modifier = _parse_modifier_spec(args.modifier) if args.modifier else None
+    if modifier is not None:
+        print(f"\nModifier active: {modifier.describe()}")
+
+    cache = CacheTap(base_cache, sink, run_id=run_id, modifier=modifier)
     print(f"\nCacheTap ready: cache is now a {type(cache).__name__}, "
           f"isinstance(cache, DynamicCache) = {isinstance(cache, DynamicCache)} "
           "(must be True -- this is the whole reason CacheTap is built the way it is; "
@@ -155,16 +199,31 @@ def main() -> None:
         print(f"Cross-check: KVHookManager hooked {len(hook_mgr.hooked_layers)} modules "
               f"(expect {n_layers}, language-model only).")
 
-    gen_kwargs = dict(
-        max_new_tokens=args.max_new_tokens, do_sample=False,
-        return_dict_in_generate=True, past_key_values=cache,
-    )
-    if args.cross_check:
-        gen_kwargs["output_attentions"] = True
+    def _run_generate(past_key_values):
+        gen_kwargs = dict(
+            max_new_tokens=args.max_new_tokens, do_sample=False,
+            return_dict_in_generate=True, past_key_values=past_key_values,
+        )
+        if args.cross_check:
+            gen_kwargs["output_attentions"] = True
+        t0 = time.perf_counter()
+        out = model.generate(**inputs, **gen_kwargs)
+        return out, (time.perf_counter() - t0) * 1000.0
 
-    t0 = time.perf_counter()
-    gen_out = model.generate(**inputs, **gen_kwargs)
-    total_ms = (time.perf_counter() - t0) * 1000.0
+    baseline_text = None
+    if args.compare_baseline and modifier is not None:
+        print("\n--compare-baseline: running an unmodified generation first, for comparison...")
+        try:
+            baseline_base_cache = DynamicCache(config=text_cfg)
+        except TypeError:
+            baseline_base_cache = DynamicCache()
+        baseline_run_id = f"{run_id}_baseline"
+        baseline_cache = CacheTap(baseline_base_cache, sink, run_id=baseline_run_id)  # no modifier=
+        baseline_out, baseline_ms = _run_generate(baseline_cache)
+        baseline_text = tok.decode(baseline_out.sequences[0], skip_special_tokens=True)
+        print(f"Baseline (no modifier): {baseline_text!r} ({baseline_ms:.1f}ms)")
+
+    gen_out, total_ms = _run_generate(cache)
 
     if hook_mgr is not None:
         hook_mgr.detach()
@@ -173,6 +232,17 @@ def main() -> None:
     generated_len = gen_out.sequences.shape[1] - prompt_len
     print(f"\nPrompt ({prompt_len} tok) + generated ({generated_len} tok): {text!r}")
     print(f"Wall-clock for generate(): {total_ms:.1f}ms")
+    # Note: `prompt_len + generated_len` (tokens in the OUTPUT sequence)
+    # can come out one higher than what the cache itself reports holding
+    # (see describe_cache() below) -- observed on a real run: 6+5=11
+    # sequence tokens, but every layer's cache held only 10. This isn't a
+    # capture bug (verify_capture_integrity below confirms CacheTap's
+    # count matches the cache's OWN get_seq_length() exactly, every time)
+    # -- it's that transformers doesn't need to cache the very LAST
+    # generated token's K/V once generation is stopping: that token's
+    # IDENTITY was already determined, and there's no further decode step
+    # that would ever need to attend back to it. Flagging so the two
+    # numbers not matching doesn't look like a discrepancy to chase.
 
     # ------------------------------------------------------------------ #
     # Milestone 2: prove the capture is correct -- not by eyeballing an
@@ -251,15 +321,56 @@ def main() -> None:
     # Compression (Subproblem 3) -- unmodified; same 6 plugins, real Gemma KV.
     # ------------------------------------------------------------------ #
     evaluator = Evaluator(min_compression_ratio=1.3)
+
+    # head_pruning bug fix: it was previously called with NO kwargs at all,
+    # meaning attn_weights=None (CacheTap never sees attention weights --
+    # only K/V, by design, so there's no real entropy signal available
+    # here without --cross-check) and the default entropy_threshold=1.0.
+    # HeadPruning's norm-fallback importance values are real KV L2 norms
+    # (tens on real Gemma -- see the per-token stats above), so comparing
+    # them against a threshold of 1.0 meant EVERY head cleared the bar and
+    # NOTHING was ever pruned -- exactly the "1.00x, 0 error" result this
+    # was caught from. Fixed: threshold is now the real median of this
+    # layer's actual per-head KV norms, so roughly half the heads
+    # (whichever are below-median importance) get pruned -- a meaningful
+    # demonstration using data actually available here, not a fixed
+    # constant that happened to be miscalibrated for real-Gemma-scale values.
+    per_head_norms = np.linalg.norm(k_layer, axis=(1, 2))
+    head_prune_threshold = float(np.median(per_head_norms))
+    print(f"\nhead_pruning threshold: median per-head KV norm = {head_prune_threshold:.3f} "
+          f"(per-head norms: {[round(float(x), 2) for x in per_head_norms]})")
+
     print(f"\nCompression benchmark, layer {layer_idx}, real Gemma KV block {k_layer.shape}:")
     for name in PLUGIN_REGISTRY:
-        kwargs = {"low_rank": {"rank": min(16, n_tokens - 1)}, "sliding_window": {"window": max(4, n_tokens // 2)},
-                  "token_eviction": {"keep_n": max(4, n_tokens // 2)}}.get(name, {})
+        kwargs = {
+            "low_rank": {"rank": min(16, n_tokens - 1)},
+            "sliding_window": {"window": max(4, n_tokens // 2)},
+            "token_eviction": {"keep_n": max(4, n_tokens // 2)},
+            "head_pruning": {"entropy_threshold": head_prune_threshold},
+        }.get(name, {})
         rep = evaluator.benchmark_plugin(get_plugin(name), k_layer, **kwargs)
         err = rep.reconstruction_max_abs_err
         err_str = f"{err:8.5f}" if err is not None else "     N/A"
         print(f"  {name:>14}: {rep.compression_ratio:5.2f}x   latency {rep.latency_ms:7.4f}ms   "
               f"max err {err_str}   [{'PASS' if rep.passed else 'below threshold'}]")
+
+    if modifier is not None:
+        mutated_text = text
+        integrity_ok = integrity["all_match"]
+        mutation_db = MutationDB(DATA_DIR / "mutations_gemma.db")
+        mutation_db.log(
+            run_id=run_id, mutation_type=modifier.name, config=modifier.describe(),
+            prompt=args.prompt, baseline_output=baseline_text or "(not run -- use --compare-baseline)",
+            mutated_output=mutated_text, latency_ms=total_ms, integrity_passed=integrity_ok,
+        )
+        mutation_db.close()
+        print(f"\nMutation experiment logged to {DATA_DIR / 'mutations_gemma.db'} "
+              f"(mutation_type={modifier.name!r}).")
+        if baseline_text is not None:
+            changed = baseline_text != mutated_text
+            print(f"Output changed vs. baseline: {'YES' if changed else 'no'}")
+            print(f"  baseline: {baseline_text!r}")
+            print(f"  mutated:  {mutated_text!r}")
 
     print(f"\nDone. events_gemma.db has {len(events)} real rows (this run only) -- point the debugger at it:\n"
           f"  streamlit run debugger/app_streamlit.py   (sidebar -> events.db path -> "

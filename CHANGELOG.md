@@ -1,5 +1,93 @@
 # Changelog
 
+## 2026-07-29 (afternoon) -- Live KV modification: from inspector to research platform
+
+`examples/run_gemma.py` ran successfully end-to-end against real
+`google/gemma-3-4b-it` for the first time since the CacheTap redesign
+(`op.txt`) -- `DynamicCache(config=text_cfg)` construction worked exactly
+as documented, `isinstance(cache, DynamicCache)` held, and
+`verify_capture_integrity` reported ALL MATCH across all 34 real layers.
+Milestones 1-4 from the previous entry are now confirmed against a real
+checkpoint, not just unit-tested.
+
+That run also surfaced two real, worth-fixing issues, and prompted the
+biggest feature addition yet.
+
+### Bugs found in op.txt's real output
+
+- **`head_pruning: 1.00x, 0 error`, every time.** Traced to a real bug,
+  not "operating on a copy" (though that observation was also correct,
+  see below): `run_gemma.py` called `head_pruning` with no kwargs at all,
+  so it fell back to KV-norm-based importance (real Gemma norms run in
+  the tens) compared against the default `entropy_threshold=1.0` --
+  every head cleared that bar trivially, so nothing was ever pruned.
+  Fixed: the threshold is now the real median of that layer's actual
+  per-head KV norms, computed from the same captured tensor, so roughly
+  half the heads get pruned as a meaningful demonstration rather than a
+  miscalibrated constant.
+- **`generated_len` (5) vs. the cache's own reported length (10, for a
+  6-token prompt) don't sum to 11.** Not a capture bug --
+  `verify_capture_integrity` already proved CacheTap's count matches
+  `get_seq_length()` exactly. `transformers` doesn't need to cache the
+  very last generated token's K/V once generation is stopping (nothing
+  will ever attend back to it), so the cache legitimately ends up one
+  entry short of `prompt_len + generated_len`. Documented in
+  `run_gemma.py` so it doesn't look like an unresolved discrepancy.
+
+### The bigger idea: KVModifier
+
+Everything up to now only *observes* the cache. `core/kv_modifiers.py`
+adds a `KVModifier` interface, wired directly into `CacheTap.update()`:
+after the real cache append, a modifier gets the full current key/value
+for that layer and can return a changed version, which is written back
+into the cache's own storage (`core.cache_adapters.set_layer_kv`) --
+so the change is what the model's own next attention computation reads,
+and *persists* for every future step, not just the one where it ran.
+This is what turns "zero this token" from an offline reconstruction-error
+metric into an actual causal experiment about the model.
+
+Six modifiers implemented: `ZeroModifier`, `NoiseModifier`,
+`SwapTokensModifier`, `HeadMaskModifier` (drop via scale=0, amplify via
+scale>1), `MemoryDecayModifier` (stateful -- decays only what pre-existed
+each call, so it compounds to `decay_per_step**n` correctly without
+storing pristine originals), and `LowRankModifier` (reuses
+`compression.plugins.LowRankCompression` live, every step -- "compression
+in the loop" rather than a static benchmark). `MutationDB`
+(`core/storage.py`) records every experiment: mutation type, config,
+prompt, baseline output, mutated output, latency, and whether
+`verify_capture_integrity` still held after the intervention.
+
+**Proven causally, not just wired structurally** -- ran for real, in this
+sandbox (pure numpy, no torch needed): `examples/run_mutation_demo.py`, a
+small standalone 4D-cache model (deliberately separate from
+`examples/synthetic_model.py`, so nothing about `run_demo.py`'s existing
+validated pipeline was touched or risked), showed all 8 tested
+interventions changing greedy-decoded output vs. an identical unmodified
+baseline, with `verify_capture_integrity` passing throughout. The
+memory-decay compounding math was checked against a real measured ratio,
+not just asserted: 0.9**6 predicted, 0.5314 both predicted and measured
+from actual before/after L2 norms.
+
+A real bug surfaced building this, fixed before it shipped:
+`core.cache_adapters.get_layer_kv`/`set_layer_kv` only handled the two
+real-transformers shapes -- this repo's own `.k`/`.v` list convention
+(`examples/synthetic_model.py`'s `NumpyKVCache`, and several test fakes)
+wasn't recognized, so modifier write-back silently had nowhere to go
+against anything but a real `DynamicCache`. Both functions now handle
+three conventions uniformly.
+
+`examples/run_gemma.py` gained `--modifier 'name:key=val;key=val'` (e.g.
+`--modifier 'zero:token_positions=0,3'`) and `--compare-baseline` (runs
+generation twice -- once clean, once modified -- and diffs the output),
+logging every real-Gemma mutation experiment to
+`data/mutations_gemma.db`. **Not yet run against a real checkpoint** --
+the parser and wiring are tested without torch, but nobody has pointed
+`--modifier` at real Gemma yet.
+
+`requirements.txt`: `torch`/`transformers`/`accelerate` uncommented,
+unpinned (by request) -- confirmed working unpinned against real Gemma 3
+4B as of this session.
+
 ## 2026-07-29 -- CacheTap becomes the sole source of KVEvents
 
 Following up on 07-28's run: re-running the fixed module-matching logic

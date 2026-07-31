@@ -341,6 +341,70 @@ class KnowledgeGraphDB:
         self._conn.close()
 
 
+# ---------------------------------------------------------------------------
+# MutationDB -- reproducible KVModifier experiments (core/kv_modifiers.py)
+# ---------------------------------------------------------------------------
+
+_MUTATION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS mutations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    ts REAL NOT NULL,
+    mutation_type TEXT NOT NULL,
+    config_json TEXT,
+    prompt TEXT,
+    baseline_output TEXT,
+    mutated_output TEXT,
+    output_changed INTEGER,
+    latency_ms REAL,
+    integrity_passed INTEGER
+);
+"""
+
+
+class MutationDB:
+    """One row per live KV-intervention experiment -- exactly the record
+    TODO.txt asked for: mutation type + target + parameters, generated
+    output (both baseline and mutated, so a diff is always one query
+    away), latency, and whether `verify_capture_integrity` still held
+    after the intervention (a modifier that corrupts the cache in a way
+    that breaks the layer's own seq-length accounting is a real failure
+    mode worth catching, not just "did the text change")."""
+
+    def __init__(self, db_path: str | Path):
+        self.db_path = str(db_path)
+        self._conn = sqlite3.connect(self.db_path)
+        self._conn.executescript(_MUTATION_SCHEMA)
+        self._conn.commit()
+
+    def log(
+        self, run_id: str, mutation_type: str, config: dict, prompt: str,
+        baseline_output: str, mutated_output: str, latency_ms: float,
+        integrity_passed: bool,
+    ) -> int:
+        cur = self._conn.execute(
+            """INSERT INTO mutations
+               (run_id, ts, mutation_type, config_json, prompt, baseline_output,
+                mutated_output, output_changed, latency_ms, integrity_passed)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                run_id, time.time(), mutation_type, json.dumps(config, default=str), prompt,
+                baseline_output, mutated_output, int(baseline_output != mutated_output),
+                latency_ms, int(integrity_passed),
+            ),
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    def recent(self, n: int = 20) -> list[dict]:
+        cur = self._conn.execute("SELECT * FROM mutations ORDER BY id DESC LIMIT ?", (n,))
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def close(self) -> None:
+        self._conn.close()
+
+
 def make_sink(kind: str, path: str | Path) -> EventSink:
     """Factory used by config/models.yaml's `storage.kind: sqlite|jsonl|memory`."""
     if kind == "sqlite":

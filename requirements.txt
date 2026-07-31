@@ -22,10 +22,13 @@ plotly>=5.22
 streamlit>=1.35
 pytest>=8.0
 
-# --- Mode 2: real model mode (NOT installed in this sandbox) ---
-# torch>=2.3               # core/hooks.py's KVHookManager + CacheTap target this API
-# transformers>=4.42        # for loading Gemma + its Cache/DynamicCache objects
-# accelerate>=0.30          # multi-GPU / device_map="auto" loading of larger Gemma variants
+# --- Mode 2: real model mode ---
+# Confirmed working against real google/gemma-3-4b-it on 2026-07-29 (see
+# CHANGELOG.md) -- unpinned by request; pin these yourself if you want a
+# reproducible environment rather than "whatever's latest today".
+torch
+transformers
+accelerate
 # bitsandbytes>=0.43        # real fp8/int4 kernels (compression/plugins.py numpy versions
 #                            #  are reference implementations of the same algorithms)
 # lm-eval>=0.4               # for evaluate_accuracy against real ARC/HellaSwag

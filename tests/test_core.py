@@ -9,6 +9,8 @@ these are the isolated per-function/class checks.
 """
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
@@ -16,7 +18,7 @@ from core.hooks import (
     looks_like_attention_module, compute_attn_entropy, tensor_bytes,
     CacheTap, KVHookManager, verify_capture_integrity,
 )
-from core.cache_adapters import get_layer_kv, get_layer_meta, describe_cache
+from core.cache_adapters import get_layer_kv, set_layer_kv, get_layer_meta, describe_cache
 from core.inspector import KVCacheInspector
 from core.storage import InMemoryEventSink, ExperienceDB, KnowledgeGraphDB
 from compression.plugins import PLUGIN_REGISTRY, get_plugin
@@ -274,6 +276,70 @@ def test_cache_tap_exposes_call_counts_for_cross_checking():
     cache.update(np.zeros((2, 1, 4), dtype=np.float32), np.zeros((2, 1, 4), dtype=np.float32), 0)
     cache.update(np.zeros((2, 1, 4), dtype=np.float32), np.zeros((2, 1, 4), dtype=np.float32), 1)
     assert cache._kv_introspector_call_counts == {0: 2, 1: 1}
+
+
+class _Dummy4DCache:
+    """Like _DummyCache but with a real heads axis -- [batch, heads, seq,
+    head_dim] -- matching real transformers Cache tensors, for testing
+    CacheTap's modifier wiring specifically (core/kv_modifiers.py's
+    modifiers are written against this 4D shape)."""
+    def __init__(self, heads=2, dim=4):
+        self.k = np.zeros((1, heads, 0, dim), dtype=np.float32)
+        self.v = np.zeros((1, heads, 0, dim), dtype=np.float32)
+
+    def update(self, k, v, layer_idx, cache_kwargs=None):
+        self.k = np.concatenate([self.k, k], axis=2)
+        self.v = np.concatenate([self.v, v], axis=2)
+        return self.k, self.v
+
+    def get_seq_length(self, layer_idx=0):
+        return self.k.shape[2]
+
+
+def test_cache_tap_with_modifier_changes_what_gets_stored():
+    from core.kv_modifiers import ZeroModifier
+    sink = InMemoryEventSink()
+    modifier = ZeroModifier(token_positions=[1])
+    cache = CacheTap(_Dummy4DCache(), sink, run_id="t", modifier=modifier)
+
+    k1 = np.random.default_rng(0).normal(size=(1, 2, 3, 4)).astype(np.float32)  # 3-token prefill
+    k_out, v_out = cache.update(k1, k1, layer_idx=0)
+    assert np.all(k_out[:, :, 1, :] == 0)              # position 1 was zeroed by the modifier
+    assert not np.all(k_out[:, :, 0, :] == 0)            # position 0 untouched
+
+
+def test_cache_tap_with_modifier_persists_across_future_calls():
+    """The whole point of writing back into the cache's own storage: a
+    zeroed token must STAY zeroed after further generation steps, not
+    just affect the one forward pass where it was zeroed."""
+    from core.kv_modifiers import ZeroModifier
+    sink = InMemoryEventSink()
+    modifier = ZeroModifier(token_positions=[0])
+    cache = CacheTap(_Dummy4DCache(), sink, run_id="t", modifier=modifier)
+
+    prefill = np.random.default_rng(0).normal(size=(1, 2, 3, 4)).astype(np.float32)
+    cache.update(prefill, prefill, layer_idx=0)
+    assert np.all(cache.k[:, :, 0, :] == 0)   # zeroed on the call where it was added
+
+    decode1 = np.random.default_rng(1).normal(size=(1, 2, 1, 4)).astype(np.float32)
+    k_out, _ = cache.update(decode1, decode1, layer_idx=0)
+    # a LATER call, that never touched position 0 directly -- it must
+    # still be zero, proving the write-back persisted rather than only
+    # affecting the return value of the call where modify() ran.
+    assert np.all(k_out[:, :, 0, :] == 0)
+    assert np.all(cache.k[:, :, 0, :] == 0)
+
+
+def test_cache_tap_without_modifier_is_unaffected():
+    """No modifier passed -> behaves exactly as before (regression guard
+    against the modifier wiring accidentally changing the no-modifier path)."""
+    sink = InMemoryEventSink()
+    cache = CacheTap(_Dummy4DCache(), sink, run_id="t")  # no modifier=
+    k1 = np.random.default_rng(0).normal(size=(1, 2, 3, 4)).astype(np.float32)
+    k_out, v_out = cache.update(k1, k1, layer_idx=0)
+    np.testing.assert_array_equal(k_out, k1)
+    rows = sink.read_all()
+    assert len(rows) == 3
 
 
 def test_verify_capture_integrity_matches_when_correct():
@@ -534,6 +600,28 @@ def test_experience_db_round_trip(tmp_path):
     assert rows[0]["lesson"] == "lesson text"
 
 
+def test_mutation_db_round_trip(tmp_path):
+    from core.storage import MutationDB
+    db = MutationDB(tmp_path / "mut.db")
+    db.log(run_id="r1", mutation_type="zero", config={"token_positions": [1]},
+           prompt="[1,2,3]", baseline_output="[4,5]", mutated_output="[4,6]",
+           latency_ms=1.2, integrity_passed=True)
+    rows = db.recent(5)
+    assert len(rows) == 1
+    assert rows[0]["mutation_type"] == "zero"
+    assert rows[0]["output_changed"] == 1
+    assert rows[0]["integrity_passed"] == 1
+    assert json.loads(rows[0]["config_json"]) == {"token_positions": [1]}
+
+
+def test_mutation_db_detects_unchanged_output(tmp_path):
+    from core.storage import MutationDB
+    db = MutationDB(tmp_path / "mut2.db")
+    db.log(run_id="r2", mutation_type="null", config={}, prompt="p",
+           baseline_output="same", mutated_output="same", latency_ms=0.1, integrity_passed=True)
+    assert db.recent(1)[0]["output_changed"] == 0
+
+
 def test_knowledge_graph_entities_and_relationships(tmp_path):
     kg = KnowledgeGraphDB(tmp_path / "kg.db")
     kg.upsert_entity("Token", "token:0", position=0)
@@ -624,6 +712,34 @@ def test_get_layer_kv_dynamic_cache_layers_format():
     meta1 = get_layer_meta(cache, 1)
     assert meta1.layer_type == "global"
     assert meta1.window_size is None
+
+
+def test_get_layer_kv_simple_k_v_list_convention():
+    """This repo's own convention (examples/synthetic_model.py's
+    NumpyKVCache): cache.k / cache.v as lists indexed by layer_idx."""
+    class _SimpleCache:
+        def __init__(self):
+            self.k = [np.zeros((2, 3, 4)), np.ones((2, 3, 4))]
+            self.v = [np.zeros((2, 3, 4)), np.ones((2, 3, 4)) * 2]
+
+    cache = _SimpleCache()
+    k, v = get_layer_kv(cache, 1)
+    np.testing.assert_array_equal(k, cache.k[1])
+    np.testing.assert_array_equal(v, cache.v[1])
+
+
+def test_set_layer_kv_simple_k_v_list_convention_round_trips():
+    class _SimpleCache:
+        def __init__(self):
+            self.k = [np.zeros((2, 3, 4))]
+            self.v = [np.zeros((2, 3, 4))]
+
+    cache = _SimpleCache()
+    new_k, new_v = np.ones((2, 3, 4)), np.ones((2, 3, 4)) * 5
+    set_layer_kv(cache, 0, new_k, new_v)
+    got_k, got_v = get_layer_kv(cache, 0)
+    np.testing.assert_array_equal(got_k, new_k)
+    np.testing.assert_array_equal(got_v, new_v)
 
 
 def test_get_layer_kv_key_value_cache_list_format():
